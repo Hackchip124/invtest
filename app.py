@@ -696,21 +696,6 @@ def get_product_by_id(product_id):
     finally:
         conn.close()
 
-def generate_barcode(product_id, product_name):
-    """Generate barcode image for a product"""
-    try:
-        code = barcode.get_barcode_class('code128')
-        barcode_image = code(product_id, writer=ImageWriter())
-        
-        # Save to temp file
-        temp_dir = tempfile.mkdtemp()
-        file_path = os.path.join(temp_dir, f"{product_name}_{product_id}")
-        filename = barcode_image.save(file_path)
-        
-        return filename
-    except Exception as e:
-        raise ValueError(f"Failed to generate barcode: {str(e)}")
-
 def get_product_categories():
     """Get unique product categories"""
     conn = sqlite3.connect('inventory.db')
@@ -1533,32 +1518,7 @@ def product_management_page():
             st.dataframe(products)
             
             # Barcode generation
-            selected_product_id = st.selectbox(
-                "Select Product to Generate Barcode",
-                options=products[products['is_active'] == 1]['id'],
-                format_func=lambda x: products[products['id'] == x]['name'].iloc[0],
-                key="barcode_product"
-            )
             
-            if selected_product_id and st.button("Generate Barcode"):
-                try:
-                    product = get_product_by_id(selected_product_id)
-                    if not product:
-                        st.error("Product not found")
-                    else:
-                        barcode_file = generate_barcode(product['id'], product['name'])
-                        
-                        st.image(barcode_file, caption=f"Barcode for {product['name']}")
-                        
-                        with open(barcode_file, "rb") as f:
-                            st.download_button(
-                                label="Download Barcode",
-                                data=f,
-                                file_name=f"barcode_{product['name']}.png",
-                                mime="image/png"
-                            )
-                except Exception as e:
-                    st.error(f"Failed to generate barcode: {str(e)}")
         except Exception as e:
             st.error(f"Failed to load product data: {str(e)}")
     
