@@ -1,0 +1,7 @@
+streamlit==1.32.2
+pandas==2.1.4
+python-barcode==0.14.0
+Pillow==10.1.0
+fpdf2==2.7.7
+matplotlib==3.8.2
+python-dateutil==2.8.2
