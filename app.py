@@ -13,6 +13,9 @@ import time
 import matplotlib.pyplot as plt
 from fpdf import FPDF
 import tempfile
+import shutil
+import json
+import zipfile
 
 # ==============================================
 # DATABASE SETUP & CONFIGURATION
@@ -164,6 +167,18 @@ def initialize_database():
         FOREIGN KEY(user_id) REFERENCES users(id)
     )''')
     
+    # Backup Metadata Table
+    cursor.execute('''CREATE TABLE IF NOT EXISTS backup_metadata (
+        id TEXT PRIMARY KEY,
+        backup_date TIMESTAMP NOT NULL,
+        backup_type TEXT NOT NULL,
+        file_path TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        notes TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    )''')
+    
     # Check for missing columns and add them if needed
     cursor.execute("PRAGMA table_info(products)")
     product_columns = [column[1] for column in cursor.fetchall()]
@@ -205,6 +220,155 @@ def initialize_database():
     conn.close()
 
 # ==============================================
+# BACKUP & RESTORE FUNCTIONS
+# ==============================================
+
+def create_complete_backup(user_id, backup_type="manual", notes=None):
+    """Create a complete backup of all system data"""
+    try:
+        # Create backup directory if it doesn't exist
+        os.makedirs("backups", exist_ok=True)
+        
+        # Generate backup filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_id = generate_short_id("BKP-")
+        zip_filename = f"backups/inventory_backup_{timestamp}.zip"
+        
+        # Create a temporary directory for backup files
+        temp_dir = tempfile.mkdtemp()
+        
+        try:
+            # 1. Backup the database file
+            db_backup_path = os.path.join(temp_dir, "inventory.db")
+            shutil.copy2('inventory.db', db_backup_path)
+            
+            # 2. Backup barcode images if directory exists
+            if os.path.exists('assets/barcodes'):
+                barcode_backup_dir = os.path.join(temp_dir, "barcodes")
+                shutil.copytree('assets/barcodes', barcode_backup_dir)
+            
+            # 3. Create JSON exports of all critical tables for redundancy
+            tables_to_backup = [
+                'users', 'suppliers', 'customers', 'products', 
+                'inventory_transactions', 'sales_orders', 
+                'order_items', 'payments'
+            ]
+            
+            conn = sqlite3.connect('inventory.db')
+            for table in tables_to_backup:
+                try:
+                    df = pd.read_sql_query(f"SELECT * FROM {table}", conn)
+                    json_path = os.path.join(temp_dir, f"{table}.json")
+                    df.to_json(json_path, orient='records', indent=2)
+                except Exception as e:
+                    st.error(f"Error backing up table {table}: {str(e)}")
+            conn.close()
+            
+            # Create the zip archive
+            with zipfile.ZipFile(zip_filename, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for root, dirs, files in os.walk(temp_dir):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        arcname = os.path.relpath(file_path, temp_dir)
+                        zipf.write(file_path, arcname)
+            
+            # Read the created backup file into memory
+            with open(zip_filename, 'rb') as f:
+                backup_content = f.read()
+            
+            # Record backup in metadata table
+            conn = sqlite3.connect('inventory.db')
+            try:
+                conn.execute(
+                    """INSERT INTO backup_metadata (
+                        id, backup_date, backup_type, file_path, user_id, notes
+                    ) VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        backup_id,
+                        datetime.now(),
+                        backup_type,
+                        zip_filename,
+                        user_id,
+                        notes
+                    )
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            
+            return backup_id, zip_filename, backup_content
+        
+        finally:
+            # Clean up temporary directory
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            
+    except Exception as e:
+        raise ValueError(f"Backup failed: {str(e)}")
+
+def restore_complete_backup(backup_file):
+    """Restore the system from a complete backup file"""
+    try:
+        # Create a temporary directory for extraction
+        temp_dir = tempfile.mkdtemp()
+        
+        try:
+            # Extract the backup zip file
+            with zipfile.ZipFile(backup_file, 'r') as zipf:
+                zipf.extractall(temp_dir)
+            
+            # Verify the backup contains required files
+            required_files = ['inventory.db']
+            for file in required_files:
+                if not os.path.exists(os.path.join(temp_dir, file)):
+                    raise ValueError(f"Backup file is missing required file: {file}")
+            
+            # Create backup of current database before restore
+            current_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            shutil.copy2('inventory.db', f'inventory.db.bak_{current_timestamp}')
+            
+            # Replace current database with backup
+            shutil.copy2(os.path.join(temp_dir, 'inventory.db'), 'inventory.db')
+            
+            # Restore barcode images if they exist in backup
+            backup_barcodes_dir = os.path.join(temp_dir, 'barcodes')
+            if os.path.exists(backup_barcodes_dir):
+                os.makedirs('assets/barcodes', exist_ok=True)
+                for file in os.listdir(backup_barcodes_dir):
+                    shutil.copy2(
+                        os.path.join(backup_barcodes_dir, file),
+                        os.path.join('assets/barcodes', file)
+                    )
+            
+            return True
+        
+        finally:
+            # Clean up temporary directory
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            
+    except Exception as e:
+        raise ValueError(f"Restore failed: {str(e)}")
+
+def get_backup_history():
+    """Get list of all backups"""
+    conn = sqlite3.connect('inventory.db')
+    try:
+        query = """
+        SELECT 
+            b.id,
+            b.backup_date,
+            b.backup_type,
+            b.file_path,
+            u.username as created_by,
+            b.notes
+        FROM backup_metadata b
+        JOIN users u ON b.user_id = u.id
+        ORDER BY b.backup_date DESC
+        """
+        return pd.read_sql(query, conn)
+    finally:
+        conn.close()
+
+# ==============================================
 # UTILITY FUNCTIONS
 # ==============================================
 
@@ -224,6 +388,25 @@ def verify_password(stored_password, provided_password):
     stored_key = stored_password[16:]
     new_key = hashlib.pbkdf2_hmac('sha256', provided_password.encode('utf-8'), salt, 100000)
     return stored_key == new_key
+
+def generate_barcode(product_id, barcode_value):
+    """Generate a barcode image for a product"""
+    try:
+        # Create barcode directory if it doesn't exist
+        os.makedirs("assets/barcodes", exist_ok=True)
+        
+        # Generate barcode image
+        code = barcode.Code128(barcode_value, writer=ImageWriter())
+        filename = code.save(f"assets/barcodes/{product_id}")
+        
+        # Convert to base64 for HTML display
+        with open(filename, "rb") as image_file:
+            encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+        
+        return encoded_string, filename
+    except Exception as e:
+        st.error(f"Failed to generate barcode: {str(e)}")
+        return None, None
 
 # ==============================================
 # AUTHENTICATION & USER MANAGEMENT
@@ -551,6 +734,11 @@ def add_product(product_data):
             )
         )
         conn.commit()
+        
+        # Generate barcode image
+        if not product_data.get('barcode'):
+            generate_barcode(product_id, barcode_value)
+        
         return product_id
     except sqlite3.IntegrityError as e:
         if "UNIQUE" in str(e):
@@ -1518,7 +1706,29 @@ def product_management_page():
             st.dataframe(products)
             
             # Barcode generation
-            
+            if st.checkbox("Show Barcode Generator"):
+                selected_product = st.selectbox(
+                    "Select Product for Barcode",
+                    options=products[products['is_active'] == 1]['id'],
+                    format_func=lambda x: products[products['id'] == x]['name'].iloc[0]
+                )
+                
+                if selected_product:
+                    product = get_product_by_id(selected_product)
+                    if product and product['barcode']:
+                        barcode_value = product['barcode']
+                        encoded_string, filename = generate_barcode(selected_product, barcode_value)
+                        
+                        if encoded_string:
+                            st.image(f"data:image/png;base64,{encoded_string}")
+                            st.download_button(
+                                label="Download Barcode",
+                                data=open(filename, "rb").read(),
+                                file_name=f"barcode_{selected_product}.png",
+                                mime="image/png"
+                            )
+                    else:
+                        st.warning("Selected product doesn't have a barcode")
         except Exception as e:
             st.error(f"Failed to load product data: {str(e)}")
     
@@ -1756,7 +1966,7 @@ def sales_management_page():
                                 product_id = st.selectbox(
                                     f"Product {i+1}*",
                                     options=products['id'],
-                                    format_func=lambda x: products[products['id'] == x]['name'].iloc[0],
+                                    format_func=lambda x: f"{products[products['id'] == x]['name'].iloc[0]} - {products[products['id'] == x]['description'].iloc[0] if products[products['id'] == x]['description'].iloc[0] else 'No description'}",
                                     key=f"product_{i}"
                                 )
                             with col2:
@@ -2039,9 +2249,212 @@ def sales_management_page():
     except Exception as e:
         st.error(f"Error in sales management: {str(e)}")
 
+def sales_customer_management_page():
+    """Customer management interface specifically for sales staff"""
+    if st.session_state.user['role'] not in ['sales', 'admin', 'manager']:
+        st.warning("You don't have permission to access this page")
+        return
+    
+    st.title("Customer Management")
+    
+    tab1, tab2, tab3 = st.tabs(["View Customers", "Add Customer", "Customer Details"])
+    
+    with tab1:
+        try:
+            st.subheader("Customer List")
+            
+            # Add search and filter functionality
+            col1, col2 = st.columns(2)
+            with col1:
+                search_term = st.text_input("Search by name, contact, or phone")
+            with col2:
+                show_inactive = st.checkbox("Show inactive customers", False)
+            
+            # Get customers with optional filters
+            customers = get_customers(active_only=not show_inactive)
+            
+            if search_term:
+                customers = customers[
+                    customers['name'].str.contains(search_term, case=False) |
+                    customers['contact'].str.contains(search_term, case=False) |
+                    customers['phone'].str.contains(search_term, case=False)
+                ]
+            
+            # Display simplified customer table
+            st.dataframe(
+                customers[['name', 'contact', 'email', 'phone', 'address']],
+                use_container_width=True,
+                hide_index=True
+            )
+        except Exception as e:
+            st.error(f"Failed to load customer data: {str(e)}")
+    
+    with tab2:
+        try:
+            st.subheader("Add New Customer")
+            with st.form("add_customer_form", clear_on_submit=True):
+                st.write("Please fill in all required fields (*)")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    name = st.text_input("Company Name*")
+                    contact = st.text_input("Contact Person*")
+                    email = st.text_input("Email*")
+                with col2:
+                    phone = st.text_input("Phone*")
+                    tax_number = st.text_input("Tax Number")
+                    payment_terms = st.number_input("Payment Terms (days)", min_value=0, value=30)
+                
+                address = st.text_area("Address*")
+                notes = st.text_area("Additional Notes")
+                
+                submitted = st.form_submit_button("Add Customer")
+                if submitted:
+                    if not all([name, contact, email, phone, address]):
+                        st.error("Please fill all required fields")
+                    else:
+                        try:
+                            customer_data = {
+                                'name': name,
+                                'contact': contact,
+                                'email': email,
+                                'phone': phone,
+                                'address': address,
+                                'tax_number': tax_number if tax_number else None,
+                                'payment_terms': payment_terms,
+                                'credit_limit': 0  # Default value for sales
+                            }
+                            customer_id = add_customer(customer_data)
+                            st.success(f"Customer added successfully! ID: {customer_id}")
+                            time.sleep(1)
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error adding customer: {str(e)}")
+        except Exception as e:
+            st.error(f"Failed to load form data: {str(e)}")
+    
+    with tab3:
+        try:
+            st.subheader("Customer Details")
+            
+            # Customer selection
+            customers = get_customers(active_only=False)
+            selected_customer = st.selectbox(
+                "Select Customer",
+                options=customers['id'],
+                format_func=lambda x: f"{customers[customers['id'] == x]['name'].iloc[0]} ({x})",
+                index=None,
+                placeholder="Search customer..."
+            )
+            
+            if selected_customer:
+                customer = get_customer_by_id(selected_customer)
+                
+                if customer:
+                    with st.form("edit_customer_form"):
+                        st.write(f"Editing: {customer['name']}")
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            new_name = st.text_input("Company Name", value=customer['name'])
+                            new_contact = st.text_input("Contact Person", value=customer['contact'])
+                            new_email = st.text_input("Email", value=customer['email'])
+                        with col2:
+                            new_phone = st.text_input("Phone", value=customer['phone'])
+                            new_tax = st.text_input("Tax Number", value=customer['tax_number'])
+                            new_terms = st.number_input(
+                                "Payment Terms (days)", 
+                                min_value=0, 
+                                value=customer['payment_terms']
+                            )
+                        
+                        new_address = st.text_area("Address", value=customer['address'])
+                        new_notes = st.text_area("Notes", value=customer.get('notes', ''))
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            if st.form_submit_button("Update Customer"):
+                                try:
+                                    customer_data = {
+                                        'name': new_name,
+                                        'contact': new_contact,
+                                        'email': new_email,
+                                        'phone': new_phone,
+                                        'address': new_address,
+                                        'tax_number': new_tax,
+                                        'payment_terms': new_terms,
+                                        'notes': new_notes
+                                    }
+                                    update_customer(selected_customer, customer_data)
+                                    st.success("Customer updated successfully!")
+                                    time.sleep(1)
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Error updating customer: {str(e)}")
+                        
+                        # Only show deactivation option if customer is active
+                        if customer['is_active']:
+                            with col2:
+                                if st.form_submit_button("Deactivate Customer"):
+                                    try:
+                                        set_customer_status(selected_customer, False)
+                                        st.success("Customer deactivated successfully!")
+                                        time.sleep(1)
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(f"Error deactivating customer: {str(e)}")
+                        else:
+                            with col2:
+                                if st.form_submit_button("Activate Customer"):
+                                    try:
+                                        set_customer_status(selected_customer, True)
+                                        st.success("Customer activated successfully!")
+                                        time.sleep(1)
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(f"Error activating customer: {str(e)}")
+                    
+                    # Customer order history
+                    st.divider()
+                    st.subheader("Order History")
+                    orders = get_sales_orders(customer_id=selected_customer)
+                    
+                    if not orders.empty:
+                        # Calculate summary metrics
+                        total_orders = len(orders)
+                        total_spent = orders['total_amount'].sum()
+                        avg_order = total_spent / total_orders
+                        last_order = orders['order_date'].max()
+                        
+                        col1, col2, col3, col4 = st.columns(4)
+                        col1.metric("Total Orders", total_orders)
+                        col2.metric("Total Spent", f"${total_spent:,.2f}")
+                        col3.metric("Average Order", f"${avg_order:,.2f}")
+                        col4.metric("Last Order", last_order.strftime('%Y-%m-%d'))
+                        
+                        # Display orders
+                        st.dataframe(
+                            orders[['id', 'order_date', 'status', 'total_amount', 'payment_status']],
+                            column_config={
+                                "id": "Order ID",
+                                "order_date": "Date",
+                                "total_amount": st.column_config.NumberColumn(
+                                    "Amount",
+                                    format="$%.2f"
+                                ),
+                                "payment_status": "Payment"
+                            },
+                            hide_index=True,
+                            use_container_width=True
+                        )
+                    else:
+                        st.info("No order history found for this customer")
+        except Exception as e:
+            st.error(f"Failed to load customer details: {str(e)}")
+
 def customer_management_page():
     """Render customer management page (only for managers and admins)"""
-    if st.session_state.user['role'] not in ['admin', 'manager']:
+    if st.session_state.user['role'] not in ['admin', 'manager','sales']:
         st.warning("You don't have permission to access this page")
         return
     
@@ -2428,6 +2841,114 @@ def reporting_page():
     except Exception as e:
         st.error(f"Failed to initialize reporting page: {str(e)}")
 
+def backup_restore_page():
+    """Render backup and restore page (only for admins)"""
+    if st.session_state.user['role'] != 'admin':
+        st.warning("You don't have permission to access this page")
+        return
+    
+    st.title("Backup & Restore")
+    
+    tab1, tab2 = st.tabs(["Create Backup", "Restore Backup"])
+    
+    with tab1:
+        try:
+            st.subheader("Create Complete System Backup")
+            st.info("This will backup all data: suppliers, orders, customers, products, and inventory")
+            
+            notes = st.text_area("Backup Notes")
+            
+            if st.button("Create Complete Backup Now"):
+                with st.spinner("Creating comprehensive backup..."):
+                    try:
+                        backup_id, backup_path, backup_content = create_complete_backup(
+                            st.session_state.user['id'], 
+                            notes=notes
+                        )
+                        st.success(f"Backup created successfully! Backup ID: {backup_id}")
+                        
+                        # Add download button
+                        st.download_button(
+                            label="Download Complete Backup",
+                            data=backup_content,
+                            file_name=f"complete_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                            mime="application/zip"
+                        )
+                    except Exception as e:
+                        st.error(f"Failed to create backup: {str(e)}")
+            
+            st.subheader("Backup History")
+            backups = get_backup_history()
+            if not backups.empty:
+                st.dataframe(backups)
+                
+                # Add download option for historical backups
+                selected_backup = st.selectbox(
+                    "Select Backup to Download",
+                    options=backups['file_path']
+                )
+                
+                if selected_backup and os.path.exists(selected_backup):
+                    with open(selected_backup, 'rb') as f:
+                        st.download_button(
+                            label="Download Selected Backup",
+                            data=f,
+                            file_name=os.path.basename(selected_backup),
+                            mime="application/zip"
+                        )
+                else:
+                    st.warning("Selected backup file not found on disk")
+            else:
+                st.info("No backups found")
+        except Exception as e:
+            st.error(f"Failed to load backup data: {str(e)}")
+    
+    with tab2:
+        try:
+            st.subheader("Restore Complete System Backup")
+            st.warning("""
+                **WARNING:** Restoring will overwrite ALL current data including:
+                - Suppliers
+                - Customers
+                - Products
+                - Inventory
+                - Orders
+                - User accounts
+                
+                Proceed with extreme caution!
+            """)
+            
+            uploaded_file = st.file_uploader("Upload Backup File", type=['zip'])
+            
+            if uploaded_file is not None:
+                # Verify the file before proceeding
+                if not st.checkbox("I understand this will overwrite all current data"):
+                    st.stop()
+                
+                if st.button("Restore Complete Backup"):
+                    with st.spinner("Restoring complete backup..."):
+                        try:
+                            # Save uploaded file to temp location
+                            temp_dir = tempfile.mkdtemp()
+                            backup_path = os.path.join(temp_dir, uploaded_file.name)
+                            
+                            with open(backup_path, 'wb') as f:
+                                f.write(uploaded_file.getbuffer())
+                            
+                            if restore_complete_backup(backup_path):
+                                st.success("""
+                                    Backup restored successfully! 
+                                    The application will now refresh.
+                                """)
+                                time.sleep(2)
+                                st.rerun()
+                        except Exception as e:
+                            st.error(f"Failed to restore backup: {str(e)}")
+                        finally:
+                            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception as e:
+            st.error(f"Failed to initialize restore page: {str(e)}")
+
 def login_page():
     """Render the login page"""
     st.title("Inventory & Sales Management System")
@@ -2503,19 +3024,19 @@ def main():
             st.title(f"Welcome, {st.session_state.user.get('full_name', st.session_state.user['username'])}")
             st.caption(f"Role: {st.session_state.user['role'].title()}")
             
-            # Navigation options based on role
+            # Navigation options based on user role
             if st.session_state.user['role'] == 'sales':
-                nav_options = ["Dashboard", "Sales"]
+                nav_options = ["Dashboard", "Sales", "Customer Management"]
             elif st.session_state.user['role'] == 'manager':
                 nav_options = ["Dashboard", "Inventory", "Products", "Sales", "Customers", "Suppliers", "Reports"]
             else:  # admin
-                nav_options = ["Dashboard", "Inventory", "Products", "Sales", "Customers", "Suppliers", "Reports", "User Management"]
+                nav_options = ["Dashboard", "Inventory", "Products", "Sales", "Customers", "Suppliers", "Reports", "User Management", "Backup/Restore"]
             
             selected_page = st.radio("Navigation", nav_options)
             
             if st.button("Logout"):
                 st.session_state.user = None
-                
+                st.rerun()
         
         # Main content area
         try:
@@ -2529,18 +3050,23 @@ def main():
                 sales_management_page()
             elif selected_page == "Customers":
                 customer_management_page()
+            elif selected_page == "Customer Management":
+                sales_customer_management_page()
             elif selected_page == "Suppliers":
                 supplier_management_page()
             elif selected_page == "Reports":
                 reporting_page()
             elif selected_page == "User Management":
                 user_management_page()
+            elif selected_page == "Backup/Restore":
+                backup_restore_page()
         except Exception as e:
             st.error(f"An error occurred: {str(e)}")
 
 if __name__ == "__main__":
     # Create required directories
     os.makedirs("assets/barcodes", exist_ok=True)
+    os.makedirs("backups", exist_ok=True)
     os.makedirs("reports", exist_ok=True)
     
     # Run the application
