@@ -389,24 +389,7 @@ def verify_password(stored_password, provided_password):
     new_key = hashlib.pbkdf2_hmac('sha256', provided_password.encode('utf-8'), salt, 100000)
     return stored_key == new_key
 
-def generate_barcode(product_id, barcode_value):
-    """Generate a barcode image for a product"""
-    try:
-        # Create barcode directory if it doesn't exist
-        os.makedirs("assets/barcodes", exist_ok=True)
-        
-        # Generate barcode image
-        code = barcode.Code128(barcode_value, writer=ImageWriter())
-        filename = code.save(f"assets/barcodes/{product_id}")
-        
-        # Convert to base64 for HTML display
-        with open(filename, "rb") as image_file:
-            encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
-        
-        return encoded_string, filename
-    except Exception as e:
-        st.error(f"Failed to generate barcode: {str(e)}")
-        return None, None
+
 
 # ==============================================
 # AUTHENTICATION & USER MANAGEMENT
@@ -735,9 +718,7 @@ def add_product(product_data):
         )
         conn.commit()
         
-        # Generate barcode image
-        if not product_data.get('barcode'):
-            generate_barcode(product_id, barcode_value)
+        
         
         return product_id
     except sqlite3.IntegrityError as e:
@@ -1704,31 +1685,6 @@ def product_management_page():
             st.subheader("Product List")
             products = get_products(active_only=False)
             st.dataframe(products)
-            
-            # Barcode generation
-            if st.checkbox("Show Barcode Generator"):
-                selected_product = st.selectbox(
-                    "Select Product for Barcode",
-                    options=products[products['is_active'] == 1]['id'],
-                    format_func=lambda x: products[products['id'] == x]['name'].iloc[0]
-                )
-                
-                if selected_product:
-                    product = get_product_by_id(selected_product)
-                    if product and product['barcode']:
-                        barcode_value = product['barcode']
-                        encoded_string, filename = generate_barcode(selected_product, barcode_value)
-                        
-                        if encoded_string:
-                            st.image(f"data:image/png;base64,{encoded_string}")
-                            st.download_button(
-                                label="Download Barcode",
-                                data=open(filename, "rb").read(),
-                                file_name=f"barcode_{selected_product}.png",
-                                mime="image/png"
-                            )
-                    else:
-                        st.warning("Selected product doesn't have a barcode")
         except Exception as e:
             st.error(f"Failed to load product data: {str(e)}")
     
