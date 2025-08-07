@@ -2175,11 +2175,11 @@ def sales_management_page():
                                 
                                 payment_method = st.selectbox(
                                     "Payment Method*",
-                                    ["Cash", "Credit Card", "Bank Transfer", "Check", "Other"]
+                                    ["Cash", "Credit Card", "Bank Transfer", "Cheque", "Other"]
                                 )
                                 
                                 payment_date = st.date_input("Payment Date", datetime.now())
-                                reference = st.text_input("Reference/Check Number")
+                                reference = st.text_input("Reference/Cheque Number")
                                 notes = st.text_area("Notes")
                                 
                                 submitted = st.form_submit_button("Process Payment")
