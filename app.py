@@ -1880,11 +1880,11 @@ def sales_management_page():
         if st.session_state.user['role'] == 'sales':
             tabs = ["Create Order", "View Orders"]
             tab1, tab2 = st.tabs(tabs)
-            tab3 = None  # No third tab for sales
+            tab3 = None
         elif st.session_state.user['role'] == 'manager':
             tabs = ["Approve Orders", "View Orders"]
             tab1, tab2 = st.tabs(tabs)
-            tab3 = None  # No third tab for manager
+            tab3 = None
         else:  # admin
             tabs = ["Create Order", "View Orders", "Process Payments"]
             tab1, tab2, tab3 = st.tabs(tabs)
@@ -1896,83 +1896,184 @@ def sales_management_page():
                 customers = get_customers()
                 products = get_products()
                 
-                with st.form("create_order_form", clear_on_submit=True):
+                # Initialize session state for items if not exists
+                if 'order_items' not in st.session_state:
+                    st.session_state.order_items = []
+                
+                # Product selection section
+                st.markdown("### Add Products to Order")
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    selected_product = st.selectbox(
+                        "Select Product",
+                        options=products['id'],
+                        format_func=lambda x: (
+                            f"{products[products['id'] == x]['name'].iloc[0]} - "
+                            f"{products[products['id'] == x]['description'].iloc[0] or 'No description'}"
+                        ),
+                        key="product_select"
+                    )
+                
+                # Product details section
+                if selected_product:
+                    product = get_product_by_id(selected_product)
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        quantity = st.number_input(
+                            "Quantity",
+                            min_value=0.01,
+                            value=1.0,
+                            step=0.01,
+                            key="quantity_input"
+                        )
+                    with col2:
+                        unit_price = st.number_input(
+                            "Unit Price ($)",
+                            min_value=0.0,
+                            value=float(product['selling_price']),
+                            key="price_input"
+                        )
+                    with col3:
+                        discount = st.number_input(
+                            "Discount (%)",
+                            min_value=0.0,
+                            max_value=100.0,
+                            value=0.0,
+                            key="discount_input"
+                        )
+                
+                # Add item button
+                if st.button("➕ Add Item to Order"):
+                    if selected_product and quantity > 0:
+                        new_item = {
+                            'product_id': selected_product,
+                            'quantity': quantity,
+                            'unit_price': unit_price,
+                            'discount': discount,
+                            'vat_rate': product['vat_rate']
+                        }
+                        st.session_state.order_items.append(new_item)
+                        st.success("Item added to order!")
+                        st.rerun()
+                    else:
+                        st.warning("Please select a product and enter valid quantity")
+                
+                # Current order items display
+                if st.session_state.order_items:
+                    st.markdown("### Current Order Items")
+                    items_df = pd.DataFrame(st.session_state.order_items)
+                    items_df['product_name'] = items_df['product_id'].apply(
+                        lambda x: products[products['id'] == x]['name'].iloc[0]
+                    )
+                    items_df['product_description'] = items_df['product_id'].apply(
+                        lambda x: products[products['id'] == x]['description'].iloc[0] or 'No description'
+                    )
+                    items_df['line_total'] = items_df['quantity'] * items_df['unit_price'] * (1 - items_df['discount']/100)
+                    
+                    # Display items in a nicer table format
+                    st.dataframe(
+                        items_df[[
+                            'product_name', 
+                            'product_description', 
+                            'quantity', 
+                            'unit_price', 
+                            'discount', 
+                            'line_total'
+                        ]],
+                        column_config={
+                            "product_name": "Product",
+                            "product_description": "Description",
+                            "quantity": "Qty",
+                            "unit_price": st.column_config.NumberColumn(
+                                "Unit Price",
+                                format="$%.2f"
+                            ),
+                            "discount": st.column_config.NumberColumn(
+                                "Discount",
+                                format="%.1f%%"
+                            ),
+                            "line_total": st.column_config.NumberColumn(
+                                "Total",
+                                format="$%.2f"
+                            )
+                        },
+                        hide_index=True,
+                        use_container_width=True
+                    )
+                    
+                    # Item removal section
+                    remove_index = st.selectbox(
+                        "Select item to remove",
+                        options=range(len(st.session_state.order_items)),
+                        format_func=lambda x: (
+                            f"{items_df.iloc[x]['product_name']} - "
+                            f"Qty: {items_df.iloc[x]['quantity']} - "
+                            f"${items_df.iloc[x]['line_total']:.2f}"
+                        ),
+                        key="remove_select"
+                    )
+                    
+                    if st.button("➖ Remove Selected Item"):
+                        st.session_state.order_items.pop(remove_index)
+                        st.rerun()
+                
+                # Order details form
+                with st.form("order_form", border=True):
+                    st.markdown("### Order Details")
                     col1, col2 = st.columns(2)
                     with col1:
                         customer_id = st.selectbox(
                             "Customer*",
                             options=customers['id'],
-                            format_func=lambda x: customers[customers['id'] == x]['name'].iloc[0]
+                            format_func=lambda x: customers[customers['id'] == x]['name'].iloc[0],
+                            key="customer_select"
                         )
                     with col2:
-                        required_date = st.date_input("Required Date")
+                        required_date = st.date_input(
+                            "Required Date",
+                            key="required_date"
+                        )
                     
-                    notes = st.text_area("Notes")
+                    order_discount = st.number_input(
+                        "Order Discount (%)", 
+                        min_value=0.0, 
+                        max_value=100.0, 
+                        value=0.0,
+                        key="order_discount"
+                    )
                     
-                    st.subheader("Order Items")
-                    items = []
+                    notes = st.text_area(
+                        "Order Notes",
+                        placeholder="Add any special instructions...",
+                        key="order_notes"
+                    )
                     
-                    # Dynamic item addition
-                    num_items = st.number_input("Number of Items", min_value=1, max_value=20, value=1)
+                    # Calculate order summary
+                    if st.session_state.order_items:
+                        subtotal = sum(item['quantity'] * item['unit_price'] * (1 - item['discount']/100) 
+                                    for item in st.session_state.order_items)
+                        total_discount = subtotal * (order_discount/100)
+                        vat_amount = (subtotal - total_discount) * 0.05  # Assuming 5% VAT
+                        total_amount = subtotal - total_discount + vat_amount
+                        
+                        st.markdown("### Order Summary")
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.metric("Subtotal", f"${subtotal:.2f}")
+                            st.metric("Order Discount", f"-${total_discount:.2f}")
+                        with col2:
+                            st.metric("VAT (5%)", f"${vat_amount:.2f}")
+                            st.metric("Total Amount", f"${total_amount:.2f}", delta_color="off")
                     
-                    for i in range(num_items):
-                        with st.expander(f"Item {i+1}"):
-                            col1, col2, col3 = st.columns(3)
-                            with col1:
-                                product_id = st.selectbox(
-                                    f"Product {i+1}*",
-                                    options=products['id'],
-                                    format_func=lambda x: f"{products[products['id'] == x]['name'].iloc[0]} - {products[products['id'] == x]['description'].iloc[0] if products[products['id'] == x]['description'].iloc[0] else 'No description'}",
-                                    key=f"product_{i}"
-                                )
-                            with col2:
-                                quantity = st.number_input(
-                                    "Quantity*",
-                                    min_value=0.01,
-                                    value=1.0,
-                                    step=0.01,
-                                    key=f"quantity_{i}"
-                                )
-                            with col3:
-                                unit_price = st.number_input(
-                                    "Unit Price*",
-                                    min_value=0.0,
-                                    value=products[products['id'] == product_id]['selling_price'].iloc[0],
-                                    key=f"price_{i}"
-                                )
-                            
-                            col1, col2 = st.columns(2)
-                            with col1:
-                                discount = st.number_input(
-                                    "Discount %",
-                                    min_value=0.0,
-                                    max_value=100.0,
-                                    value=0.0,
-                                    key=f"discount_{i}"
-                                )
-                            with col2:
-                                vat_rate = st.number_input(
-                                    "VAT Rate %",
-                                    min_value=0.0,
-                                    max_value=100.0,
-                                    value=products[products['id'] == product_id]['vat_rate'].iloc[0],
-                                    key=f"vat_{i}"
-                                )
-                            
-                            if product_id and quantity > 0:
-                                items.append({
-                                    'product_id': product_id,
-                                    'quantity': quantity,
-                                    'unit_price': unit_price,
-                                    'discount': discount,
-                                    'vat_rate': vat_rate
-                                })
+                    # Form submit button
+                    submitted = st.form_submit_button(
+                        "📝 Create Order", 
+                        type="primary", 
+                        use_container_width=True
+                    )
                     
-                    order_discount = st.number_input("Order Discount", min_value=0.0, max_value=100.0, value=0.0)
-                    
-                    submit = st.form_submit_button("Create Order")
-                    if submit:
-                        if not items:
+                    if submitted:
+                        if not st.session_state.order_items:
                             st.error("Please add at least one item to the order")
                         else:
                             try:
@@ -1982,26 +2083,31 @@ def sales_management_page():
                                     'notes': notes,
                                     'discount': order_discount,
                                     'user_id': st.session_state.user['id'],
-                                    'items': items,
-                                    'vat_rate': 5.0  # Default VAT rate
+                                    'items': st.session_state.order_items,
+                                    'vat_rate': 5.0
                                 }
                                 
                                 with st.spinner("Creating order..."):
                                     order_id = create_sales_order(order_data)
                                     
-                                    # For sales role, set to pending approval
                                     if st.session_state.user['role'] == 'sales':
                                         update_order_status(order_id, 'pending_approval')
-                                        st.success(f"Order created successfully and sent for approval! ID: {order_id}")
+                                        st.success(f"Order created and sent for approval! ID: {order_id}")
                                     else:
                                         st.success(f"Order created successfully! ID: {order_id}")
                                     
+                                    # Clear the order items after successful submission
+                                    st.session_state.order_items = []
                                     time.sleep(2)
+                                    st.rerun()
                                 
                             except Exception as e:
                                 st.error(f"Error creating order: {str(e)}")
 
-        # APPROVE ORDERS TAB (for manager)
+      
+
+        
+
         elif tab1 and st.session_state.user['role'] == 'manager':
             with tab1:
                 st.subheader("Orders Pending Approval")
@@ -2204,7 +2310,6 @@ def sales_management_page():
                     st.error(f"Failed to load payment data: {str(e)}")
     except Exception as e:
         st.error(f"Error in sales management: {str(e)}")
-
 def sales_customer_management_page():
     """Customer management interface specifically for sales staff"""
     if st.session_state.user['role'] not in ['sales', 'admin', 'manager']:
